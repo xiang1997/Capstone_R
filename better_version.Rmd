@@ -1,0 +1,567 @@
+---
+title: "Output"
+author: "XiangYu"
+date: "2019/11/23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r package}
+library(ggplot2)
+library(stringr)
+library(data.table)
+library(stopwords)
+library(tm)
+library(frequency)
+library(lubridate)
+library(corpus)
+library(janeaustenr)
+library(dplyr)
+library(rpart)
+library(rpart.plot)
+library(e1071)
+library(nnet)
+library(xgboost)
+library(randomForest)
+library(Matrix)
+require(caTools)
+library(pROC)
+library(DiagrammeR)
+library(DiagrammeRsvg)
+library(rsvg)
+```
+
+```{r loading and cleaning}
+# load the dataset
+dna_data_2013 <- setDT(readRDS("~/business_innovation_cmda_2019/data/working/DNA_Aggregated/dna_2013.RDS"))
+new.dna_data_2013 <- copy(dna_data_2013)
+
+new.dna_data_2013[, publication_datetime := as_datetime(as.numeric(publication_datetime)/1000)]
+new.dna_data_2013[, modification_datetime := as_datetime(as.numeric(modification_datetime)/1000)] 
+
+removeNumPunct <- function(x) gsub("[^[:alpha:][:space:]]*", "", x)
+
+new.dna_data_2013$title <- tm_map(new.dna_data_2013$title, content_transformer(removeNumPunct))
+
+# define the stop words
+stopwords <- as.vector(c("inc", "corp", "ltd","plc","llc","hold?ing?s","international","group","acquisition","american","china","usa"))
+pharmstopwords <- c("biopharma", "therapeutics?", "pharmaceuticals?", "international", "sciences?", "medical", "technology", "phrma", "pharma", "bio", "biosciences?")
+EN = stopwords(kind = "en")
+EN[175]="and"
+EN[176]="the"
+EN[177]="for"
+EN[178]="pharmaceut"
+
+
+EN=c(EN,stopwords,pharmstopwords)
+```
+
+```{r build tdm matrix}
+corpus.2013 = Corpus(VectorSource(new.dna_data_2013$title)) # transform to corpus
+corpus.2013 = tm_map(corpus.2013, content_transformer(tolower)) # lowercase
+
+tdm = TermDocumentMatrix(corpus.2013,
+                         control = list(weighting = weightTfIdf,
+                                        stopwords = EN, # Remove Stopwords
+                                        removePunctuation = T, # Remove Punctuation markers
+                                        removeNumbers = T, # Remove numbers
+                                        stemming = T)) # stemming
+# remove the sparasity at rate 99%
+tdm = removeSparseTerms(tdm, 0.99)
+freq=rowSums(as.matrix(tdm))
+freq
+# plot most frequency part
+high.freq=tail(sort(freq),n=10)
+hfp.df=as.data.frame(sort(high.freq))
+hfp.df$names <- rownames(hfp.df) 
+
+ggplot(hfp.df, aes(reorder(names,high.freq), high.freq)) +
+  geom_bar(stat="identity") + coord_flip() + 
+  xlab("Words") + ylab("TF-IDF value") +
+  ggtitle("Top value words")
+
+# convert the form into matrix
+tdm.data = as.data.frame(t(as.matrix(tdm)))
+```
+
+```{r c22 labeling}
+# subject code
+for (i in 1:nrow(new.dna_data_2013)) {
+  new.dna_data_2013$label[i]=grepl("c22",new.dna_data_2013$subject_codes[i])
+}
+# if subject code contains "c22", label will returen "TRUE", other will be false
+tdm.data$label=new.dna_data_2013$label # copy the value of label to tdm dataset
+```
+
+```{r Random Forest}
+# subsampling the dataset (# 1)
+set.seed(100)
+tdm.sample=tdm.data[sample(nrow(tdm.data), 50000),]
+head(tdm.sample$label,10) 
+# split sample into train and test dataset
+set.seed(100)
+sample = sample.split(tdm.sample,SplitRatio = 0.7) 
+train1 =subset(tdm.sample,sample ==TRUE) # first train dataset
+test1=subset(tdm.sample, sample==FALSE) # first test dataset
+# apply randomforest to train data
+fit1=randomForest(label~.,data = train1)
+# use model to predict how match for test dataset
+pred=predict(fit1,test1,type = "class")
+
+# AUC cureve
+roc <- roc(test1$label,pred)
+# table(test1$label,pred,dnn = c("real","pred"))
+plot(roc, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),grid.col=c("green", "red"), 
+          max.auc.polygon=TRUE,auc.polygon.col="skyblue", print.thres=TRUE,main='randomforest_ROC_sample1')
+```
+
+```{r c22 XGBoosting}
+# XGB is faster, so do not need subsample
+sample = sample.split(tdm.data,SplitRatio = 0.7) 
+train1 =subset(tdm.data,sample ==TRUE) # first train dataset
+test1=subset(tdm.data, sample==FALSE) # first test dataset
+traindata1 <- data.matrix(train1[,c(1:122)])
+traindata2 <- as.matrix(traindata1)
+traindata3 <- train1[,123]
+traindata4 <- list(data=traindata2,label=traindata3) 
+# build the matrix
+dtrain <- xgb.DMatrix(data = traindata4$data, label = traindata4$label) 
+
+# build the xgb function and iterations for 400 times
+xgb <- xgboost(data = dtrain,max_depth=6, eta=0.2,  objective='binary:logistic',nrounds=200)
+
+testset1 <- data.matrix(test1[,c(1:122)]) 
+testset2 <- as.matrix(testset1)
+testset3 <- test1[,123]
+testset4 <- list(data=testset2,label=testset3) 
+# build the matrix
+dtest <- xgb.DMatrix(data = testset4$data, label = testset4$label) 
+
+# recall the XGB model done by train data
+pre_xgb = predict(xgb,newdata = dtest)
+# AUC plot
+roc <- roc(test1$label,pre_xgb)
+# table(test1$label,pred,dnn = c("real","pred"))
+plot(roc, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),grid.col=c("green", "red"), 
+     max.auc.polygon=TRUE,auc.polygon.col="yellow", print.thres=TRUE,main='XGBOOST_ROC_overall')
+
+# improvements
+
+```
+
+
+```{r c22 method comparison}
+# subsampling the dataset (# 1)
+set.seed(100)
+tdm.sample=tdm.data[sample(nrow(tdm.data), 10000),]
+head(tdm.sample$label,10)
+# split sample into train and test dataset
+set.seed(100)
+sample = sample.split(tdm.sample,SplitRatio = 0.7) 
+train1 =subset(tdm.sample,sample ==TRUE) # first train dataset
+test1=subset(tdm.sample, sample==FALSE) # first test dataset
+# apply randomforest to train data
+fit1=randomForest(label~.,data = train1)
+# use model to predict how match for test dataset
+pred=predict(fit1,test1,type = "class")
+# AUC cureve
+roc_rand1 <- roc(test1$label,pred)
+# XGBOOSTING BINARY REGRESSION
+traindata1 <- data.matrix(train1[,c(1:122)])
+traindata2 <- as.matrix(traindata1)
+traindata3 <- train1[,123]
+traindata4 <- list(data=traindata2,label=traindata3) 
+# build the matrix
+dtrain <- xgb.DMatrix(data = traindata4$data, label = traindata4$label) 
+# build the xgb function and iterations for 400 times
+xgb <- xgboost(data = dtrain,max_depth=6, eta=0.2,  objective='binary:logistic',nrounds=50)
+testset1 <- data.matrix(test1[,c(1:122)]) 
+testset2 <- as.matrix(testset1)
+testset3 <- test1[,123]
+testset4 <- list(data=testset2,label=testset3) 
+# build the matrix
+dtest <- xgb.DMatrix(data = testset4$data, label = testset4$label) 
+# recall the XGB model done by train data
+pre_xgb = predict(xgb,newdata = dtest)
+# AUC plot
+roc_xgb1 <- roc(test1$label,pre_xgb)
+
+
+# subsampling the dataset (# 2)
+set.seed(101)
+tdm.sample=tdm.data[sample(nrow(tdm.data), 10000),]
+head(tdm.sample$label,10)
+# split sample into train and test dataset
+set.seed(101)
+sample = sample.split(tdm.sample,SplitRatio = 0.7) 
+train1 =subset(tdm.sample,sample ==TRUE) # first train dataset
+test1=subset(tdm.sample, sample==FALSE) # first test dataset
+# apply randomforest to train data
+fit1=randomForest(label~.,data = train1)
+# use model to predict how match for test dataset
+pred=predict(fit1,test1,type = "class")
+# AUC cureve
+library(pROC)
+roc_rand2 <- roc(test1$label,pred)
+# XGBOOSTING BINARY REGRESSION
+traindata1 <- data.matrix(train1[,c(1:122)])
+traindata2 <- as.matrix(traindata1)
+traindata3 <- train1[,123]
+traindata4 <- list(data=traindata2,label=traindata3) 
+# build the matrix
+dtrain <- xgb.DMatrix(data = traindata4$data, label = traindata4$label) 
+# build the xgb function and iterations for 400 times
+xgb <- xgboost(data = dtrain,max_depth=6, eta=0.2,  objective='binary:logistic',nrounds=50)
+testset1 <- data.matrix(test1[,c(1:122)]) 
+testset2 <- as.matrix(testset1)
+testset3 <- test1[,123]
+testset4 <- list(data=testset2,label=testset3) 
+# build the matrix
+dtest <- xgb.DMatrix(data = testset4$data, label = testset4$label) 
+# recall the XGB model done by train data
+pre_xgb = predict(xgb,newdata = dtest)
+# AUC plot
+roc_xgb2 <- roc(test1$label,pre_xgb)
+
+
+# subsampling the dataset (# 3)
+set.seed(102)
+tdm.sample=tdm.data[sample(nrow(tdm.data), 10000),]
+head(tdm.sample$label,10)
+# split sample into train and test dataset
+set.seed(102)
+sample = sample.split(tdm.sample,SplitRatio = 0.7) 
+train1 =subset(tdm.sample,sample ==TRUE) # first train dataset
+test1=subset(tdm.sample, sample==FALSE) # first test dataset
+# apply randomforest to train data
+fit1=randomForest(label~.,data = train1)
+# use model to predict how match for test dataset
+pred=predict(fit1,test1,type = "class")
+# AUC cureve
+library(pROC)
+roc_rand3 <- roc(test1$label,pred)
+# table(test1$label,pred,dnn = c("real","pred"))
+plot(roc, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),grid.col=c("green", "red"), 
+     max.auc.polygon=TRUE,auc.polygon.col="skyblue", print.thres=TRUE,main='randomforest_ROC_sample3')
+
+# XGBOOSTING BINARY REGRESSION
+traindata1 <- data.matrix(train1[,c(1:122)])
+traindata2 <- as.matrix(traindata1)
+traindata3 <- train1[,123]
+traindata4 <- list(data=traindata2,label=traindata3) 
+# build the matrix
+dtrain <- xgb.DMatrix(data = traindata4$data, label = traindata4$label) 
+
+# build the xgb function and iterations for 400 times
+xgb <- xgboost(data = dtrain,max_depth=6, eta=0.2,  objective='binary:logistic',nrounds=50)
+
+testset1 <- data.matrix(test1[,c(1:122)]) 
+testset2 <- as.matrix(testset1)
+testset3 <- test1[,123]
+testset4 <- list(data=testset2,label=testset3) 
+# build the matrix
+dtest <- xgb.DMatrix(data = testset4$data, label = testset4$label) 
+
+# recall the XGB model done by train data
+pre_xgb = predict(xgb,newdata = dtest)
+# AUC plot
+roc_xgb3 <- roc(test1$label,pre_xgb)
+# table(test1$label,pred,dnn = c("real","pred"))
+plot(roc, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),grid.col=c("green", "red"), 
+     max.auc.polygon=TRUE,auc.polygon.col="orange", print.thres=TRUE,main='XGBOOST_ROC_sample3')
+```
+
+```{r method comparison plotting}
+# subsample1
+plot(roc_rand1, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),grid.col=c("green", "red"), 
+     max.auc.polygon=TRUE,auc.polygon.col="skyblue", print.thres=TRUE,main='randomforest_ROC_sample1')
+plot(roc_xgb1, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),grid.col=c("green", "red"), 
+     max.auc.polygon=TRUE,auc.polygon.col="orange", print.thres=TRUE,main='XGBOOST_ROC_sample1')
+# subsample2
+plot(roc_rand2, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),grid.col=c("green", "red"), 
+     max.auc.polygon=TRUE,auc.polygon.col="skyblue", print.thres=TRUE,main='randomforest_ROC_sample2')
+plot(roc_xgb2, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),grid.col=c("green", "red"), 
+     max.auc.polygon=TRUE,auc.polygon.col="orange", print.thres=TRUE,main='XGBOOST_ROC_sample2')
+# subsample3
+plot(roc_rand3, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),grid.col=c("green", "red"), 
+     max.auc.polygon=TRUE,auc.polygon.col="skyblue", print.thres=TRUE,main='randomforest_ROC_sample3')
+plot(roc_xgb3, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),grid.col=c("green", "red"), 
+     max.auc.polygon=TRUE,auc.polygon.col="orange", print.thres=TRUE,main='XGBOOST_ROC_sample3')
+```
+
+```{r adding first and last sentence of body}
+for (i in 1:nrow(new.dna_data_2013)) {
+  new.dna_data_2013$body_sum[i]=str_extract(new.dna_data_2013$body[i], '.*?[a-z0-9][.?!](?= )')
+}
+# the new variable "body_sum" represent the first sentence of body
+# replace the NA value into blank
+# create a new variable "outline" which combines the body_sum and title
+for (i in 1:nrow(new.dna_data_2013)) {
+  new.dna_data_2013$body_sum[i][is.na(new.dna_data_2013$body_sum[i])] <- " "
+  new.dna_data_2013$outline[i]=paste(new.dna_data_2013$title[i],new.dna_data_2013$body_sum[i])
+}
+# not run through the whole document
+# too much time for running, just finish 200108 observations 
+
+```
+
+```{r applying RandomForest and Boosting to new dataset}
+# load the dataset
+dna_data_2015 <- setDT(readRDS("~/business_innovation_cmda_2019/data/working/DNA_Aggregated/dna_2015.RDS"))
+new.dna_data_2015 <- copy(dna_data_2015)
+manual.data = read.csv("~/business_innovation_cmda_2019/data/working/DNA_Aggregated/Output_and_Labels_combined.csv")
+# merge dataset 
+comb=merge(manual.data,new.dna_data_2015,by.x = "document",by.y = "an",all.y = FALSE)
+# subset: documentID $ title $ first question $ c22 $ body
+comb=comb[,c(1,2,4,5,11)]
+colnames(comb)=c("ID", "title", "manual", "c22", "body")
+comb$manual=tolower(comb$manual) # convert to lower cases
+# the new variable "body_sum" represent the first sentence of body
+# replace the NA value into blank
+# create a new variable "outline" which combines the body_sum and title
+for (i in 1:nrow(comb)) {
+  comb$body_sum[i]=str_extract(comb$body[i], '.*?[a-z0-9][.?!](?= )')
+  comb$body_sum[i][is.na(comb$body_sum[i])] <- " "
+  comb$outline[i]=paste(comb$title[i],comb$body_sum[i])
+}
+# build tdm for sample only for title
+corpus.comb = Corpus(VectorSource(comb$title)) # transform to corpus
+corpus.comb = tm_map(corpus.comb, content_transformer(tolower)) # lowercase
+tdm.comb = TermDocumentMatrix(corpus.comb,
+                         control = list(weighting = weightTfIdf,
+                                        stopwords = EN, # Remove Stopwords
+                                        removePunctuation = T, # Remove Punctuation markers
+                                        removeNumbers = T, # Remove numbers
+                                        stemming = T)) # stemming
+# remove the sparasity at rate 99%
+tdm.comb = removeSparseTerms(tdm.comb, 0.99)
+# convert the form into matrix
+tdm.comb = as.data.frame(t(as.matrix(tdm.comb)))
+tdm.comb$manual_label=comb$manual
+tdm.comb$manual_label=tdm.comb$manual_label=="yes"
+
+s1 = sample.split(tdm.comb,SplitRatio = 0.7) 
+t1 =subset(tdm.comb,s1 ==TRUE) # first train dataset
+tt1=subset(tdm.comb, s1==FALSE) # first test dataset
+
+
+
+# build tdm for sample only for outline
+corpus.comb2 = Corpus(VectorSource(comb$outline)) # transform to corpus
+corpus.comb2 = tm_map(corpus.comb2, content_transformer(tolower)) # lowercase
+tdm.comb2 = TermDocumentMatrix(corpus.comb2,
+                         control = list(weighting = weightTfIdf,
+                                        stopwords = EN, # Remove Stopwords
+                                        removePunctuation = T, # Remove Punctuation markers
+                                        removeNumbers = T, # Remove numbers
+                                        stemming = T)) # stemming
+# remove the sparasity at rate 99%
+tdm.comb2 = removeSparseTerms(tdm.comb2, 0.99)
+# convert the form into matrix
+tdm.comb2 = as.data.frame(t(as.matrix(tdm.comb2)))
+tdm.comb2$manual_label=comb$manual
+tdm.comb2$manual_label=tdm.comb2$manual_label=="yes"
+
+s2 = sample.split(tdm.comb2,SplitRatio = 0.7) 
+t2 =subset(tdm.comb2,s2 ==TRUE) # second train dataset
+tt2=subset(tdm.comb2, s2==FALSE) # second test dataset
+
+# RandomForest
+# apply randomforest to train data
+t1$manual_label<- as.factor(t1$manual_label)
+tt1$manual_label<- as.factor(tt1$manual_label)
+
+fit1=randomForest(manual_label~.,data = t1)
+# use model to predict how match for test dataset
+pred=predict(fit1,tt1,type = "class")
+pred=as.integer(as.logical(pred))
+
+roc <- roc(tt1$manual_label,pred)
+# table(test1$label,pred,dnn = c("real","pred"))
+plot(roc, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),grid.col=c("green", "red"), 
+     max.auc.polygon=TRUE,auc.polygon.col="skyblue", print.thres=TRUE,main='randomforest')
+
+t1$manual_label<- as.factor(t1$manual_label)
+tt1$manual_label<- as.factor(tt1$manual_label)
+
+fit1=randomForest(manual_label~.,data = t1)
+# use model to predict how match for test dataset
+pred=predict(fit1,tt1,type = "class")
+pred=as.integer(as.logical(pred))
+
+roc <- roc(tt1$manual_label,pred)
+# table(test1$label,pred,dnn = c("real","pred"))
+plot(roc, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),grid.col=c("green", "red"), 
+     max.auc.polygon=TRUE,auc.polygon.col="skyblue", print.thres=TRUE,main='randomforest')
+
+
+# Boosting
+traindata1 <- data.matrix(t1[,c(1:148)])
+traindata2 <- as.matrix(traindata1)
+traindata3 <- t1[,149]
+traindata4 <- list(data=traindata2,label=traindata3) 
+# build the matrix
+dtrain <- xgb.DMatrix(data = traindata4$data, label = traindata4$label) 
+
+# build the xgb function and iterations for 400 times
+xgb <- xgboost(data = dtrain,max_depth=6, eta=0.2,  objective='binary:logistic',nrounds=20)
+
+testset1 <- data.matrix(tt1[,c(1:148)]) 
+testset2 <- as.matrix(testset1)
+testset3 <- tt1[,149]
+testset4 <- list(data=testset2,label=testset3) 
+# build the matrix
+dtest <- xgb.DMatrix(data = testset4$data, label = testset4$label) 
+
+# recall the XGB model done by train data
+pre_xgb = predict(xgb,newdata = dtest)
+# AUC plot
+roc <- roc(tt1$manual_label,pre_xgb)
+# table(test1$label,pred,dnn = c("real","pred"))
+plot(roc, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),grid.col=c("green", "red"), 
+     max.auc.polygon=TRUE,auc.polygon.col="yellow", print.thres=TRUE,main='XGBOOST_ROC_overall')
+
+# Boosting 2
+traindata1 <- data.matrix(t2[,c(1:422)])
+traindata2 <- as.matrix(traindata1)
+traindata3 <- t2[,423]
+traindata4 <- list(data=traindata2,label=traindata3) 
+# build the matrix
+dtrain <- xgb.DMatrix(data = traindata4$data, label = traindata4$label) 
+
+# build the xgb function and iterations for 400 times
+xgb <- xgboost(data = dtrain,max_depth=6, eta=0.2,  objective='binary:logistic',nrounds=20)
+
+testset1 <- data.matrix(tt2[,c(1:422)]) 
+testset2 <- as.matrix(testset1)
+testset3 <- tt2[,423]
+testset4 <- list(data=testset2,label=testset3) 
+# build the matrix
+dtest <- xgb.DMatrix(data = testset4$data, label = testset4$label) 
+
+# recall the XGB model done by train data
+pre_xgb = predict(xgb,newdata = dtest)
+# AUC plot
+roc <- roc(tt2$manual_label,pre_xgb)
+# table(test1$label,pred,dnn = c("real","pred"))
+plot(roc, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),grid.col=c("green", "red"), 
+     max.auc.polygon=TRUE,auc.polygon.col="yellow", print.thres=TRUE,main='XGBOOST_ROC_overall')
+```
+
+```{r adding first and last sentence of body}
+# build tdm for sample only for title
+corpus.comb = Corpus(VectorSource(comb$title)) # transform to corpus
+corpus.comb = tm_map(corpus.comb, content_transformer(tolower)) # lowercase
+tdm.comb = TermDocumentMatrix(corpus.comb,
+                         control = list(weighting = weightTfIdf,
+                                        stopwords = EN, # Remove Stopwords
+                                        removePunctuation = T, # Remove Punctuation markers
+                                        removeNumbers = T, # Remove numbers
+                                        stemming = T)) # stemming
+# remove the sparasity at rate 99%
+tdm.comb = removeSparseTerms(tdm.comb, 0.99)
+# convert the form into matrix
+tdm.comb = as.data.frame(t(as.matrix(tdm.comb)))
+tdm.comb$c22=comb$c22
+tdm.comb$c22=tdm.comb$c22=="yes"
+
+s1 = sample.split(tdm.comb,SplitRatio = 0.7) 
+t1 =subset(tdm.comb,s1 ==TRUE) # first train dataset
+tt1=subset(tdm.comb, s1==FALSE) # first test dataset
+
+
+
+# build tdm for sample only for outline
+corpus.comb2 = Corpus(VectorSource(comb$outline)) # transform to corpus
+corpus.comb2 = tm_map(corpus.comb2, content_transformer(tolower)) # lowercase
+tdm.comb2 = TermDocumentMatrix(corpus.comb2,
+                         control = list(weighting = weightTfIdf,
+                                        stopwords = EN, # Remove Stopwords
+                                        removePunctuation = T, # Remove Punctuation markers
+                                        removeNumbers = T, # Remove numbers
+                                        stemming = T)) # stemming
+# remove the sparasity at rate 99%
+tdm.comb2 = removeSparseTerms(tdm.comb2, 0.99)
+# convert the form into matrix
+tdm.comb2 = as.data.frame(t(as.matrix(tdm.comb2)))
+tdm.comb2$c22=comb$c22
+tdm.comb2$c22=tdm.comb2$c22=="yes"
+
+s2 = sample.split(tdm.comb2,SplitRatio = 0.7) 
+t2 =subset(tdm.comb2,s2 ==TRUE) # second train dataset
+tt2=subset(tdm.comb2, s2==FALSE) # second test dataset
+
+# RandomForest
+# apply randomforest to train data
+fit1=randomForest(c22~.,data = t1)
+# use model to predict how match for test dataset
+pred=predict(fit1,tt1,type = "class")
+roc <- roc(t1$c22,pred)
+# table(test1$label,pred,dnn = c("real","pred"))
+plot(roc, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),grid.col=c("green", "red"), 
+     max.auc.polygon=TRUE,auc.polygon.col="skyblue", print.thres=TRUE,main='randomforest')
+
+
+# Boosting
+traindata1 <- data.matrix(t1[,c(1:148)])
+traindata2 <- as.matrix(traindata1)
+traindata3 <- t1[,149]
+traindata4 <- list(data=traindata2,label=traindata3) 
+# build the matrix
+dtrain <- xgb.DMatrix(data = traindata4$data, label = traindata4$label) 
+
+# build the xgb function and iterations for 400 times
+xgb <- xgboost(data = dtrain,max_depth=6, eta=0.2,  objective='binary:logistic',nrounds=20)
+
+testset1 <- data.matrix(tt1[,c(1:148)]) 
+testset2 <- as.matrix(testset1)
+testset3 <- tt1[,149]
+testset4 <- list(data=testset2,label=testset3) 
+# build the matrix
+dtest <- xgb.DMatrix(data = testset4$data, label = testset4$label) 
+
+# recall the XGB model done by train data
+pre_xgb = predict(xgb,newdata = dtest)
+# AUC plot
+roc <- roc(tt1$c22,pre_xgb)
+# table(test1$label,pred,dnn = c("real","pred"))
+plot(roc, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),grid.col=c("green", "red"), 
+     max.auc.polygon=TRUE,auc.polygon.col="yellow", print.thres=TRUE,main='XGBOOST_ROC_overall')
+
+# Boosting 2
+traindata1 <- data.matrix(t2[,c(1:422)])
+traindata2 <- as.matrix(traindata1)
+traindata3 <- t2[,423]
+traindata4 <- list(data=traindata2,label=traindata3) 
+# build the matrix
+dtrain <- xgb.DMatrix(data = traindata4$data, label = traindata4$label) 
+
+# build the xgb function and iterations for 400 times
+xgb <- xgboost(data = dtrain,max_depth=6, eta=0.2,  objective='binary:logistic',nrounds=20)
+
+testset1 <- data.matrix(tt2[,c(1:422)]) 
+testset2 <- as.matrix(testset1)
+testset3 <- tt2[,423]
+testset4 <- list(data=testset2,label=testset3) 
+# build the matrix
+dtest <- xgb.DMatrix(data = testset4$data, label = testset4$label) 
+
+# recall the XGB model done by train data
+pre_xgb = predict(xgb,newdata = dtest)
+# AUC plot
+roc <- roc(tt2$c22,pre_xgb)
+# table(test1$label,pred,dnn = c("real","pred"))
+plot(roc, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),grid.col=c("green", "red"), 
+     max.auc.polygon=TRUE,auc.polygon.col="yellow", print.thres=TRUE,main='XGBOOST_ROC_overall')
+```
+
+
